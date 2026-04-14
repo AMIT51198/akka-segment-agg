@@ -1,0 +1,37 @@
+# ---- sbt build outputs ----
+target/
+project/target/
+project/project/target/
+
+# ---- sbt metadata ----
+.bsp/
+.metals/
+.bloop/
+project/.bloop/
+
+# ---- compiled class files ----
+*.class
+*.jar
+
+# ---- IDE ----
+.idea/
+.idea_modules/
+*.iml
+*.iws
+*.ipr
+.vscode/
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+
+# ---- CSV output files (pipeline results, benchmark outputs) ----
+*.csv
+src/main/resources/
+
+# ---- benchmark output ----
+/tmp/benchmark_results.csv
+/tmp/benchmark_dummy.csv
+
+# ---- logs ----
+*.log
