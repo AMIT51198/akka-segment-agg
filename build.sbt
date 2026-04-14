@@ -3,7 +3,6 @@ ThisBuild / organization := "com.example"
 ThisBuild / version := "0.1.0"
 
 lazy val akkaVersion = "2.8.8"
-lazy val arrowVersion = "17.0.0"
 lazy val parquetVersion = "1.14.4"
 lazy val hadoopVersion = "3.4.1"
 
@@ -21,8 +20,6 @@ lazy val root = (project in file("."))
     libraryDependencies ++= Seq(
       "com.typesafe.akka" %% "akka-actor-typed" % akkaVersion,
       "com.typesafe.akka" %% "akka-stream" % akkaVersion,
-      "org.apache.arrow" % "arrow-vector" % arrowVersion,
-      "org.apache.arrow" % "arrow-memory-netty" % arrowVersion,
       "org.apache.parquet" % "parquet-avro" % parquetVersion,
       "org.apache.parquet" % "parquet-hadoop" % parquetVersion,
       "org.apache.hadoop" % "hadoop-common" % hadoopVersion,

@@ -1,4 +1,4 @@
-package com.example.segmentagg
+package com.example.segmentagg.util
 
 import java.nio.file.Paths
 
@@ -14,13 +14,15 @@ import com.example.segmentagg.logging.PipelineLogger
 /**
  * Standalone utility that prints the Parquet footer metadata for a single file.
  *
- * Uses [[PipelineLogger]] for output rather than raw `println` (Dependency Inversion).
+ * Usage: sbt "runMain com.example.segmentagg.util.ParquetFooterInspector /path/to/file.parquet"
  */
 object ParquetFooterInspector {
 
   def main(args: Array[String]): Unit = {
     val input = args.headOption.getOrElse {
-      throw new IllegalArgumentException("Usage: runMain com.example.segmentagg.ParquetFooterInspector /path/to/file.parquet")
+      throw new IllegalArgumentException(
+        "Usage: runMain com.example.segmentagg.util.ParquetFooterInspector /path/to/file.parquet"
+      )
     }
     inspect(input, PipelineLogger.console("ParquetFooterInspector"))
   }

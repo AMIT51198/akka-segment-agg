@@ -1,8 +1,9 @@
-package com.example.segmentagg
+package com.example.segmentagg.util
 
 import java.io.{File, PrintWriter}
 import java.nio.file.Paths
 
+import com.example.segmentagg.AggregationPipeline
 import com.example.segmentagg.io.NoOpResultWriter
 import com.example.segmentagg.logging.PipelineLogger
 import com.example.segmentagg.metrics.StageMetrics
@@ -14,7 +15,7 @@ import com.example.segmentagg.parquet.{DecodeMode, DecoderPageMetrics}
  *
  * Results are written to `/tmp/benchmark_results.csv` after every run.
  *
- * Usage: sbt "runMain com.example.segmentagg.Benchmark /path/to/parquet/dir"
+ * Usage: sbt "runMain com.example.segmentagg.util.Benchmark /path/to/parquet/dir"
  */
 object Benchmark {
 
@@ -24,19 +25,19 @@ object Benchmark {
 
   def main(args: Array[String]): Unit = {
     val input = args.headOption.getOrElse(
-      throw new IllegalArgumentException("Usage: runMain com.example.segmentagg.Benchmark /path/to/parquet/dir")
+      throw new IllegalArgumentException(
+        "Usage: runMain com.example.segmentagg.util.Benchmark /path/to/parquet/dir"
+      )
     )
     val output = "/tmp/benchmark_dummy.csv"
 
     val readParallelisms = List(4, 6, 8, 10, 12, 16)
     val aggParallelisms  = List(4, 6, 8, 10, 12)
 
-    // Prepare CSV
     val csvWriter = new PrintWriter(ResultsFile)
     csvWriter.println("read_parallelism,aggregate_parallelism,elapsed_ms")
     csvWriter.flush()
 
-    // Warmup (JIT + OS cache)
     println("=" * 70)
     println("WARMUP RUN (vectorised, read=4, agg=4)")
     println("=" * 70)
@@ -62,7 +63,6 @@ object Benchmark {
     }
     csvWriter.close()
 
-    // Summary table
     println()
     println("=" * 60)
     println("ALL RESULTS (vectorised)")
@@ -73,7 +73,6 @@ object Benchmark {
       println(f"${r.readP}%-8d | ${r.aggP}%-8d | ${r.elapsedMs}%12.2f ms")
     }
 
-    // Top 10
     println()
     println("=" * 60)
     println("TOP 10 FASTEST")
@@ -84,7 +83,6 @@ object Benchmark {
       println(f"${i + 1}%-4d ${r.readP}%-8d | ${r.aggP}%-8d | ${r.elapsedMs}%12.2f ms")
     }
 
-    // Heatmap-style: best agg_p for each read_p
     println()
     println("=" * 60)
     println("BEST aggregate-parallelism PER read-parallelism")
@@ -94,7 +92,6 @@ object Benchmark {
       println(f"  read=$rp%2d → best agg=${best.aggP}%2d  (${best.elapsedMs}%10.2f ms)")
     }
 
-    // Best read_p for each agg_p
     println()
     println("=" * 60)
     println("BEST read-parallelism PER aggregate-parallelism")
@@ -119,10 +116,9 @@ object Benchmark {
       decodeMode           = DecodeMode.Vectorised
     )
 
-    // Quiet logger — only errors
     val logger = new PipelineLogger {
-      override def info(message: String): Unit = ()
-      override def warn(message: String): Unit = ()
+      override def info(message: String): Unit                            = ()
+      override def warn(message: String): Unit                            = ()
       override def error(message: String, cause: Option[Throwable]): Unit =
         System.err.println(s"[ERROR] $message")
     }

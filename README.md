@@ -108,7 +108,6 @@ Aggregate parallelism should always be ≤ read parallelism. Increasing aggregat
 ```
 src/main/scala/com/example/segmentagg/
 ├── AggregationPipeline.scala       # stream topology + lifecycle
-├── Benchmark.scala                 # parallelism grid-search benchmark
 ├── ColumnBatch.scala               # columnar batch model
 ├── BatchTiming.scala               # per-batch timing counters
 ├── Main.scala                      # CLI entry point
@@ -126,14 +125,17 @@ src/main/scala/com/example/segmentagg/
 ├── model/
 │   ├── AggregateRow.scala          # output row model
 │   └── PipelineConfig.scala        # immutable pipeline config
-└── parquet/
-    ├── ColumnChunkDecoder.scala         # scalar decoder
-    ├── VectorisedColumnChunkDecoder.scala
-    ├── VectorisedDecoders.scala
-    ├── DecodeMode.scala
-    ├── DecoderPageMetrics.scala
-    ├── RequiredColumnDecoders.scala
-    └── ...
+├── parquet/
+│   ├── ColumnChunkDecoder.scala         # scalar decoder
+│   ├── VectorisedColumnChunkDecoder.scala
+│   ├── VectorisedDecoders.scala
+│   ├── DecodeMode.scala
+│   ├── DecoderPageMetrics.scala
+│   ├── RequiredColumnDecoders.scala
+│   └── ...
+└── util/
+    ├── Benchmark.scala             # parallelism grid-search benchmark
+    └── ParquetFooterInspector.scala # inspect Parquet file metadata
 ```
 
 ---
@@ -167,10 +169,15 @@ sbt "run \
 Runs all combinations of `read-parallelism × aggregate-parallelism` with vectorised decoding and writes results to `/tmp/benchmark_results.csv`.
 
 ```bash
-sbt "runMain com.example.segmentagg.Benchmark /path/to/fact_events_parquet"
+sbt "runMain com.example.segmentagg.util.Benchmark /path/to/fact_events_parquet"
 ```
 
 Grid searched: `read ∈ {4,6,8,10,12,16}`, `agg ∈ {4,6,8,10,12}` where `agg ≤ read`.
+
+To inspect Parquet file metadata:
+```bash
+sbt "runMain com.example.segmentagg.util.ParquetFooterInspector /path/to/file.parquet"
+```
 
 ---
 
