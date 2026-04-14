@@ -1,8 +1,6 @@
 package com.example.segmentagg
 
-import java.nio.file.Path
 import java.time.Instant
-import java.util.concurrent.ConcurrentLinkedQueue
 
 import scala.concurrent.duration.Duration
 import scala.concurrent.{Await, ExecutionContext, Future}
@@ -12,108 +10,130 @@ import akka.actor.typed.scaladsl.Behaviors
 import akka.stream.Attributes
 import akka.stream.scaladsl.Sink
 
-object AggregationPipeline {
-  final case class PipelineConfig(
-      input: Path,
-      output: Path,
-      readParallelism: Int,
-      aggregateParallelism: Int
-  )
+import com.example.segmentagg.io.{CsvResultWriter, ResultWriter}
+import com.example.segmentagg.logging.PipelineLogger
+import com.example.segmentagg.metrics.{LatencyDistribution, StageMetrics}
+import com.example.segmentagg.model.PipelineConfig
+import com.example.segmentagg.parquet.DecoderPageMetrics
 
-  def run(config: PipelineConfig): Unit = {
-    val pipelineStart = Instant.now()
+/**
+ * Orchestrates the segment-revenue aggregation pipeline.
+ *
+ * Wires the Akka Streams stages together and delegates metrics collection,
+ * aggregation, and result writing to injected collaborators.
+ * New output formats can be added by providing a different [[ResultWriter]];
+ * new decode strategies by extending [[com.example.segmentagg.parquet.DecodeMode]].
+ *
+ * @param config       pipeline configuration (input path, parallelism, decode mode)
+ * @param logger       structured logger
+ * @param stageMetrics per-stage latency collector
+ * @param pageMetrics  per-column page-level decode latency collector
+ * @param resultWriter where the final aggregated rows are written
+ */
+final class AggregationPipeline(
+    config: PipelineConfig,
+    logger: PipelineLogger,
+    stageMetrics: StageMetrics,
+    pageMetrics: DecoderPageMetrics,
+    resultWriter: ResultWriter
+) {
+
+  /**
+   * Execute the pipeline: read → decode → aggregate → materialise → write.
+   *
+   * Blocks until the pipeline completes; manages the [[ActorSystem]] lifecycle.
+   */
+  def run(): Unit = {
+    val pipelineStart      = Instant.now()
     val pipelineStartNanos = System.nanoTime()
-    val metrics = new StageMetrics
-    println(
-      s"[AggregationPipeline] Starting job at $pipelineStart input=${config.input} output=${config.output} " +
-        s"readParallelism=${config.readParallelism} aggregateParallelism=${config.aggregateParallelism}"
-    )
+
+    logger.info(s"Starting job at $pipelineStart $config")
+
     implicit val system: ActorSystem[Nothing] = ActorSystem(Behaviors.empty, "segment-aggregation")
-    implicit val ec: ExecutionContext = system.executionContext
+    implicit val ec: ExecutionContext          = system.executionContext
 
     try {
-      val aggregation =
-        ParquetBatchSource
-          .source(config.input, config.readParallelism)
-          .filter(_.size > 0)
-          .addAttributes(Attributes.inputBuffer(initial = 1, max = 1))
-          .mapAsyncUnordered(config.aggregateParallelism) { batch =>
-            Future {
-              val aggregateStartNanos = System.nanoTime()
-              metrics.recordRead(batch.readEndNanos - batch.readStartNanos)
-              metrics.recordWait(aggregateStartNanos - batch.readEndNanos)
-              val partial = SegmentRevenueAggregator.aggregateBatch(batch)
-              val aggregateEndNanos = System.nanoTime()
-              metrics.recordAggregate(aggregateEndNanos - aggregateStartNanos)
-              partial
-            }
-          }
-          .runWith(Sink.fold(SegmentRevenueAggregator.PartialAggregate.empty)(_ merge _))
-
-      val completed = aggregation.map { finalAggregate =>
-        val materializeStart = System.nanoTime()
-        val rows = finalAggregate.rows
-        val materializeElapsed = System.nanoTime() - materializeStart
-        val pipelineElapsed = System.nanoTime() - pipelineStartNanos
-        val completedAt = Instant.now()
-
-        println(
-          s"[AggregationPipeline] Final aggregate materialized at $completedAt with ${finalAggregate.size} groups and ${rows.size} rows " +
-            s"(final materialize=${formatMillis(materializeElapsed)}, total elapsed=${formatMillis(pipelineElapsed)})"
-        )
-        metrics.printSummary()
-        println(s"[AggregationPipeline] CSV write skipped; result kept materialized in memory only")
-      }
-
+      val aggregation = buildStream()
+      val completed   = aggregation.map(finalAggregate => reportResults(finalAggregate, pipelineStartNanos))
       Await.result(completed, Duration.Inf)
     } finally {
-      println("[AggregationPipeline] Terminating actor system")
-      system.terminate()
-      Await.result(system.whenTerminated, Duration.Inf)
-      println("[AggregationPipeline] Actor system terminated")
+      shutdownActorSystem(system)
     }
   }
 
-  private def formatMillis(nanos: Long): String = f"${nanos / 1000000.0}%.2f ms"
+  // -- private helpers (each with a single, clear responsibility) --
 
-  private final class StageMetrics {
-    private val readNanos = new ConcurrentLinkedQueue[java.lang.Long]()
-    private val waitNanos = new ConcurrentLinkedQueue[java.lang.Long]()
-    private val aggregateNanos = new ConcurrentLinkedQueue[java.lang.Long]()
-
-    def recordRead(nanos: Long): Unit = readNanos.add(nanos)
-    def recordWait(nanos: Long): Unit = waitNanos.add(math.max(0L, nanos))
-    def recordAggregate(nanos: Long): Unit = aggregateNanos.add(nanos)
-
-    def printSummary(): Unit = {
-      println(s"[AggregationPipeline] Stage metrics read=${summary(readNanos)}")
-      println(s"[AggregationPipeline] Stage metrics wait=${summary(waitNanos)}")
-      println(s"[AggregationPipeline] Stage metrics aggregate=${summary(aggregateNanos)}")
-    }
-
-    private def summary(values: ConcurrentLinkedQueue[java.lang.Long]): String = {
-      val data = values.iterator()
-      val buffer = scala.collection.mutable.ArrayBuffer.empty[Long]
-      while (data.hasNext) {
-        buffer += data.next().longValue()
+  private def buildStream()(implicit system: ActorSystem[Nothing], ec: ExecutionContext) =
+    ParquetBatchSource
+      .source(config.input, config.readParallelism, config.decodeMode)
+      .filter(_.size > 0)
+      .addAttributes(Attributes.inputBuffer(initial = 1, max = 1))
+      .mapAsyncUnordered(config.aggregateParallelism) { batch =>
+        Future(recordAndAggregate(batch))
       }
+      .runWith(Sink.fold(SegmentRevenueAggregator.PartialAggregate.empty)(_ merge _))
 
-      if (buffer.isEmpty) {
-        "count=0"
-      } else {
-        val sorted = buffer.sorted
-        val count = sorted.size
-        val avg = sorted.sum.toDouble / count
-        val p50 = percentile(sorted, 0.50)
-        val p95 = percentile(sorted, 0.95)
-        val max = sorted.last
-        f"count=$count avg=${avg / 1000000.0}%.2f ms p50=${p50 / 1000000.0}%.2f ms p95=${p95 / 1000000.0}%.2f ms max=${max / 1000000.0}%.2f ms"
-      }
-    }
+  private def recordAndAggregate(batch: ColumnBatch): SegmentRevenueAggregator.PartialAggregate = {
+    val aggregateStartNanos = System.nanoTime()
+    val t = batch.timing
 
-    private def percentile(sorted: scala.collection.IndexedSeq[Long], p: Double): Long = {
-      val index = math.min(sorted.size - 1, math.ceil(sorted.size * p).toInt - 1)
-      sorted(index)
-    }
+    stageMetrics("fetch").record(t.fetchNanos)
+    stageMetrics("segmentDecode").record(t.segmentDecodeNanos)
+    stageMetrics("impressionDecode").record(t.impressionDecodeNanos)
+    stageMetrics("revenueDecode").record(t.revenueDecodeNanos)
+    stageMetrics("decode").record(t.totalDecodeNanos)
+    stageMetrics("read").record(t.totalReadNanos)
+    stageMetrics("wait").record(math.max(0L, aggregateStartNanos - t.decodeEndNanos))
+
+    val partial = SegmentRevenueAggregator.aggregateBatch(batch)
+    stageMetrics("aggregate").record(System.nanoTime() - aggregateStartNanos)
+    partial
+  }
+
+  private def reportResults(
+      finalAggregate: SegmentRevenueAggregator.PartialAggregate,
+      pipelineStartNanos: Long
+  ): Unit = {
+    val materializeStart   = System.nanoTime()
+    val rows               = finalAggregate.rows
+    val materializeElapsed = System.nanoTime() - materializeStart
+    val pipelineElapsed    = System.nanoTime() - pipelineStartNanos
+
+    logger.info(
+      s"Final aggregate materialised at ${Instant.now()} " +
+        s"with ${finalAggregate.size} groups and ${rows.size} rows " +
+        s"(final materialise=${LatencyDistribution.formatMillis(materializeElapsed)}, " +
+        s"total elapsed=${LatencyDistribution.formatMillis(pipelineElapsed)})"
+    )
+
+    stageMetrics.printSummary(logger)
+    pageMetrics.printSummary(logger)
+
+    resultWriter.write(rows)
+  }
+
+  private def shutdownActorSystem(system: ActorSystem[Nothing]): Unit = {
+    logger.info("Terminating actor system")
+    system.terminate()
+    Await.result(system.whenTerminated, Duration.Inf)
+    logger.info("Actor system terminated")
   }
 }
+
+/**
+ * Companion providing a one-shot entry point that constructs the pipeline
+ * with production collaborators and runs it.
+ */
+object AggregationPipeline {
+
+  /** Backward-compatible entry point. */
+  def run(config: PipelineConfig): Unit = {
+    val logger       = PipelineLogger.console("AggregationPipeline")
+    val stageMetrics = StageMetrics.pipelineDefault
+    val pageMetrics  = DecoderPageMetrics.reset()
+    val writer       = new CsvResultWriter(config.output, logger)
+
+    new AggregationPipeline(config, logger, stageMetrics, pageMetrics, writer).run()
+  }
+}
+

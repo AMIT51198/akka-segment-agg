@@ -16,12 +16,24 @@ import org.apache.parquet.hadoop.metadata.ParquetMetadata
 import org.apache.parquet.hadoop.util.HadoopInputFile
 import org.apache.parquet.schema.{MessageType, Type}
 
-import com.example.segmentagg.parquet.RequiredColumnDecoders
+import com.example.segmentagg.logging.PipelineLogger
+import com.example.segmentagg.parquet.{DecodeMode, RequiredColumnDecoders}
 
+/**
+ * Akka Streams source that reads columnar batches from Parquet files.
+ *
+ * Resolves all row groups from the input path and emits one [[ColumnBatch]]
+ * per row group. Decode strategy is plugged in via [[DecodeMode]].
+ */
 object ParquetBatchSource {
-  private val RequiredColumns = List("segment_id", "impressions", "revenue")
 
-  final case class FileReadPlan(
+  private val RequiredColumns: List[String] = List("segment_id", "impressions", "revenue")
+
+  /**
+   * The read plan for a single Parquet file — everything the row-group cursor
+   * needs to decode batches without re-reading the footer.
+   */
+  private final case class FileReadPlan(
       path: Path,
       footer: ParquetMetadata,
       schema: MessageType,
@@ -30,35 +42,48 @@ object ParquetBatchSource {
       batchIdStart: Int
   )
 
-  def source(input: Path, readParallelism: Int): Source[ColumnBatch, NotUsed] = {
-    val conf = new Configuration(false)
-    val files = resolveInputFiles(input)
-    val nextBatchId = new AtomicInteger(0)
-    val readPlans = files.map(path => buildReadPlan(path, conf, nextBatchId))
-    val rowGroupCount = readPlans.map(_.rowGroupCount).sum
+  /** Build a [[Source]] that emits one [[ColumnBatch]] per Parquet row group. */
+  def source(
+      input: Path,
+      readParallelism: Int,
+      decodeMode: DecodeMode = DecodeMode.Scalar,
+      logger: PipelineLogger = PipelineLogger.console("ParquetBatchSource")
+  ): Source[ColumnBatch, NotUsed] = {
+    val conf      = new Configuration(false)
+    val files     = resolveInputFiles(input)
+    val nextBatch = new AtomicInteger(0)
+    val plans     = files.map(buildReadPlan(_, conf, nextBatch, decodeMode))
+    val rgCount   = plans.map(_.rowGroupCount).sum
 
-    println(
-      s"[ParquetBatchSource] Resolved ${files.size} parquet files and $rowGroupCount row groups from $input"
-    )
+    logger.info(s"Resolved ${files.size} parquet files and $rgCount row groups from $input")
 
-    Source(readPlans)
+    Source(plans)
       .addAttributes(Attributes.inputBuffer(initial = 1, max = 1))
       .flatMapMerge(
-        breadth = math.max(1, math.min(readParallelism, readPlans.size)),
+        breadth = math.max(1, math.min(readParallelism, plans.size)),
         f = plan => rowGroupSource(plan, conf)
       )
       .addAttributes(Attributes.inputBuffer(initial = 1, max = 1))
   }
 
-  private def buildReadPlan(path: Path, conf: Configuration, nextBatchId: AtomicInteger): FileReadPlan = {
-    val inputFile = HadoopInputFile.fromPath(hadoopPath(path), conf)
-    val footer = Using.resource(ParquetFileReader.open(inputFile, readOptions(conf, path)))(_.getFooter)
-    val schema = projectedSchema(footer.getFileMetaData.getSchema)
-    val decoders = RequiredColumnDecoders.build(footer, schema)
-    val rowGroupCount = footer.getBlocks.size
-    val batchIdStart = nextBatchId.getAndAdd(rowGroupCount)
-    FileReadPlan(path, footer, schema, decoders, rowGroupCount, batchIdStart)
+  // -- read plan construction --
+
+  private def buildReadPlan(
+      path: Path,
+      conf: Configuration,
+      nextBatchId: AtomicInteger,
+      decodeMode: DecodeMode
+  ): FileReadPlan = {
+    val inputFile    = HadoopInputFile.fromPath(hadoopPath(path), conf)
+    val footer       = Using.resource(ParquetFileReader.open(inputFile, readOptions(conf, path)))(_.getFooter)
+    val schema       = projectedSchema(footer.getFileMetaData.getSchema)
+    val decoders     = RequiredColumnDecoders.build(footer, schema, decodeMode)
+    val rowGroupCnt  = footer.getBlocks.size
+    val batchIdStart = nextBatchId.getAndAdd(rowGroupCnt)
+    FileReadPlan(path, footer, schema, decoders, rowGroupCnt, batchIdStart)
   }
+
+  // -- schema helpers --
 
   private def projectedSchema(fileSchema: MessageType): MessageType =
     new MessageType(fileSchema.getName, RequiredColumns.map(requiredField(fileSchema, _)).asJava)
@@ -68,92 +93,96 @@ object ParquetBatchSource {
       .find(_.getName == name)
       .getOrElse(throw new IllegalArgumentException(s"Missing Parquet column: $name"))
 
+  // -- Hadoop path helpers --
+
   private def hadoopPath(path: Path): org.apache.hadoop.fs.Path =
     new org.apache.hadoop.fs.Path(path.toUri)
 
   private def readOptions(conf: Configuration, path: Path) =
     HadoopReadOptions.builder(conf, hadoopPath(path)).build()
 
-  private def resolveInputFiles(input: Path): List[Path] = {
+  // -- file resolution --
+
+  private def resolveInputFiles(input: Path): List[Path] =
     if (Files.isRegularFile(input)) {
       List(input)
     } else if (Files.isDirectory(input)) {
       Using.resource(Files.walk(input)) { stream =>
         stream.iterator().asScala
-          .filter(path => Files.isRegularFile(path) && path.getFileName.toString.toLowerCase.endsWith(".parquet"))
+          .filter(p => Files.isRegularFile(p) && p.getFileName.toString.toLowerCase.endsWith(".parquet"))
           .toList
           .sorted
       }
     } else {
       throw new IllegalArgumentException(s"Input path does not exist or is unsupported: $input")
     }
-  }
 
-  class RowGroupCursor private (
-      file: FileReadPlan,
-      reader: ParquetFileReader
-  ) {
-    private var nextRowGroupIndex = 0
+  // -- row-group cursor (encapsulates mutable reader state) --
 
-    def nextBatch(): Option[ColumnBatch] = {
-      if (nextRowGroupIndex >= file.rowGroupCount) {
-        None
-      } else {
-        val rowGroupIndex = nextRowGroupIndex
-        nextRowGroupIndex += 1
-        Some(readRowGroup(rowGroupIndex))
+  private final class RowGroupCursor(file: FileReadPlan, reader: ParquetFileReader) {
+    private var nextIndex = 0
+
+    def nextBatch(): Option[ColumnBatch] =
+      if (nextIndex >= file.rowGroupCount) None
+      else {
+        val idx = nextIndex
+        nextIndex += 1
+        Some(readRowGroup(idx))
       }
-    }
 
-    def close(): Unit = {
-      reader.close()
-    }
+    def close(): Unit = reader.close()
 
     private def readRowGroup(rowGroupIndex: Int): ColumnBatch = {
-      val readStartNanos = System.nanoTime()
-      val pages = reader.readRowGroup(rowGroupIndex)
-      if (pages == null) {
-        throw new IllegalStateException(
-          s"Parquet row group $rowGroupIndex could not be read from ${file.path}"
-        )
-      }
+      val fetchStart = System.nanoTime()
+      val pages      = reader.readRowGroup(rowGroupIndex)
+      val fetchEnd   = System.nanoTime()
+
+      if (pages == null)
+        throw new IllegalStateException(s"Parquet row group $rowGroupIndex could not be read from ${file.path}")
 
       try {
-        val rowCount = pages.getRowCount.toInt
-        val segmentIds = new Array[Long](rowCount)
+        val rowCount    = pages.getRowCount.toInt
+        val segmentIds  = new Array[Long](rowCount)
         val impressions = new Array[Long](rowCount)
-        val revenues = new Array[Double](rowCount)
+        val revenues    = new Array[Double](rowCount)
 
         file.decoders.segmentIds.decode(pages, segmentIds, rowCount)
-        file.decoders.impressions.decode(pages, impressions, rowCount)
-        file.decoders.revenues.decode(pages, revenues, rowCount)
+        val segDecodeEnd = System.nanoTime()
 
-        val readEndNanos = System.nanoTime()
-        val batchId = file.batchIdStart + rowGroupIndex + 1
-        ColumnBatch(segmentIds, impressions, revenues, rowCount, batchId, readStartNanos, readEndNanos)
+        file.decoders.impressions.decode(pages, impressions, rowCount)
+        val impDecodeEnd = System.nanoTime()
+
+        file.decoders.revenues.decode(pages, revenues, rowCount)
+        val decodeEnd = System.nanoTime()
+
+        ColumnBatch(
+          segmentIds, impressions, revenues,
+          size    = rowCount,
+          batchId = file.batchIdStart + rowGroupIndex + 1,
+          timing  = BatchTiming(fetchStart, fetchEnd, segDecodeEnd, impDecodeEnd, decodeEnd)
+        )
       } finally {
         pages.close()
       }
     }
   }
 
-  private def rowGroupSource(file: FileReadPlan, conf: Configuration): Source[ColumnBatch, NotUsed] = {
-    Source
-      .unfoldResource[ColumnBatch, RowGroupCursor](
-        create = () => RowGroupCursor.open(file, conf),
-        read = _.nextBatch(),
-        close = _.close()
-      )
-      .addAttributes(Attributes.inputBuffer(initial = 1, max = 1))
-  }
-
   private object RowGroupCursor {
     def open(file: FileReadPlan, conf: Configuration): RowGroupCursor = {
       val inputFile = HadoopInputFile.fromPath(hadoopPath(file.path), conf)
-      val reader = ParquetFileReader.open(inputFile, readOptions(conf, file.path))
+      val reader    = ParquetFileReader.open(inputFile, readOptions(conf, file.path))
       reader.setRequestedSchema(file.schema)
-
       new RowGroupCursor(file, reader)
     }
   }
+
+  private def rowGroupSource(file: FileReadPlan, conf: Configuration): Source[ColumnBatch, NotUsed] =
+    Source
+      .unfoldResource[ColumnBatch, RowGroupCursor](
+        create = () => RowGroupCursor.open(file, conf),
+        read   = _.nextBatch(),
+        close  = _.close()
+      )
+      .addAttributes(Attributes.inputBuffer(initial = 1, max = 1))
 }
+

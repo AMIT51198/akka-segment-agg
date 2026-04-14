@@ -1,30 +1,39 @@
 package com.example.segmentagg.parquet
 
-import java.math.{BigDecimal => JBigDecimal, BigInteger}
+import java.math.{BigDecimal => JBigDecimal}
+
+import scala.annotation.nowarn
+
+import org.apache.parquet.column.ColumnDescriptor
+import org.apache.parquet.column.page.{DataPage, DataPageV1, DataPageV2, PageReadStore}
+import org.apache.parquet.column.values.ValuesReader
+import org.apache.parquet.column.values.dictionary.DictionaryValuesReader
+import org.apache.parquet.column.{Dictionary, Encoding, ValuesType}
+import org.apache.parquet.hadoop.metadata.ColumnChunkMetaData
+import org.apache.parquet.io.api.Binary
+import org.apache.parquet.schema.{LogicalTypeAnnotation, PrimitiveType}
 
 import scala.jdk.CollectionConverters._
 
-import org.apache.parquet.bytes.{BytesInput, BytesUtils}
-import org.apache.parquet.column.page.{DataPage, DataPageV1, DataPageV2, DictionaryPage, PageReadStore, PageReader}
-import org.apache.parquet.column.values.rle.RunLengthBitPackingHybridDecoder
-import org.apache.parquet.column.values.ValuesReader
-import org.apache.parquet.column.{ColumnDescriptor, Dictionary, Encoding, ValuesType}
-import org.apache.parquet.hadoop.metadata.ColumnChunkMetaData
-import org.apache.parquet.io.ParquetDecodingException
-import org.apache.parquet.io.api.Binary
-import org.apache.parquet.schema.{LogicalTypeAnnotation, PrimitiveType}
+// ---------------------------------------------------------------------------
+// Trait — the single contract every column chunk decoder must honour
+// ---------------------------------------------------------------------------
 
 trait ColumnChunkDecoder[A] {
   def columnName: String
   def descriptor: ColumnDescriptor
-
   def supports(columnMeta: ColumnChunkMetaData): Boolean
-
   def decode(pageStore: PageReadStore, target: Array[A], rowCount: Int): Unit
 }
 
-abstract class PageLevelColumnChunkDecoder[A](val columnName: String, val descriptor: ColumnDescriptor)
-    extends ColumnChunkDecoder[A] {
+// ---------------------------------------------------------------------------
+// Scalar base class — page-by-page iteration via Parquet ValuesReader
+// ---------------------------------------------------------------------------
+
+abstract class PageLevelColumnChunkDecoder[A](
+    val columnName: String,
+    val descriptor: ColumnDescriptor
+) extends ColumnChunkDecoder[A] with ParquetPageHelpers {
 
   override def decode(pageStore: PageReadStore, target: Array[A], rowCount: Int): Unit = {
     val pageReader = Option(pageStore.getPageReader(descriptor))
@@ -35,134 +44,93 @@ abstract class PageLevelColumnChunkDecoder[A](val columnName: String, val descri
     var page = pageReader.readPage()
 
     while (page != null) {
+      val t0 = System.nanoTime()
       offset = decodePage(page, dictionary, target, offset)
+      DecoderPageMetrics.recordPage(columnName, System.nanoTime() - t0)
       page = pageReader.readPage()
     }
 
-    if (offset != rowCount) {
-      throw new IllegalArgumentException(
-        s"Decoded $offset values for $columnName but expected $rowCount"
-      )
-    }
+    if (offset != rowCount)
+      throw new IllegalArgumentException(s"Decoded $offset values for $columnName but expected $rowCount")
   }
 
+  /** Decode a single value from the current reader position. */
   protected def decodeValue(reader: ValuesReader): A
 
-  private def readDictionary(pageReader: PageReader): Option[Dictionary] =
-    Option(pageReader.readDictionaryPage()).map(initDictionary)
-
-  private def initDictionary(page: DictionaryPage): Dictionary =
-    page.getEncoding.initDictionary(descriptor, page)
+  // -- page dispatch --
 
   private def decodePage(page: DataPage, dictionary: Option[Dictionary], target: Array[A], offset: Int): Int =
     page.accept(new DataPage.Visitor[Int] {
-      override def visit(dataPageV1: DataPageV1): Int =
-        decodePageV1(dataPageV1, dictionary, target, offset)
-
-      override def visit(dataPageV2: DataPageV2): Int =
-        decodePageV2(dataPageV2, dictionary, target, offset)
+      override def visit(v1: DataPageV1): Int = decodePageV1(v1, dictionary, target, offset)
+      override def visit(v2: DataPageV2): Int = decodePageV2(v2, dictionary, target, offset)
     })
 
-  private def decodePageV1(
+  protected def decodePageV1(
       page: DataPageV1,
       dictionary: Option[Dictionary],
       target: Array[A],
       offset: Int
   ): Int = {
-    val repetitionLevels = valuesReader(page.getRlEncoding, ValuesType.REPETITION_LEVEL, dictionary)
-    val definitionLevels = valuesReader(page.getDlEncoding, ValuesType.DEFINITION_LEVEL, dictionary)
-    val input = page.getBytes.toInputStream
+    val input      = page.getBytes.toInputStream
     val valueCount = page.getValueCount
-
-    repetitionLevels.initFromPage(valueCount, input)
-    definitionLevels.initFromPage(valueCount, input)
-
+    val rl = valuesReader(page.getRlEncoding, ValuesType.REPETITION_LEVEL, dictionary)
+    rl.initFromPage(valueCount, input)
+    val dl = valuesReader(page.getDlEncoding, ValuesType.DEFINITION_LEVEL, dictionary)
+    dl.initFromPage(valueCount, input)
     val values = valuesReader(page.getValueEncoding, ValuesType.VALUES, dictionary)
     values.initFromPage(valueCount, input)
 
-    decodeValues(
+    scalarDecodeValues(
       valueCount,
-      new ValuesReaderIntIterator(repetitionLevels),
-      new ValuesReaderIntIterator(definitionLevels),
-      values,
-      target,
-      offset
+      new ValuesReaderIntIterator(rl),
+      new ValuesReaderIntIterator(dl),
+      values, target, offset
     )
   }
 
-  private def decodePageV2(
+  protected def decodePageV2(
       page: DataPageV2,
       dictionary: Option[Dictionary],
       target: Array[A],
       offset: Int
   ): Int = {
-    val repetitionLevels = rleIterator(descriptor.getMaxRepetitionLevel, page.getRepetitionLevels)
-    val definitionLevels = rleIterator(descriptor.getMaxDefinitionLevel, page.getDefinitionLevels)
+    val rl     = rleIterator(descriptor.getMaxRepetitionLevel, page.getRepetitionLevels)
+    val dl     = rleIterator(descriptor.getMaxDefinitionLevel, page.getDefinitionLevels)
     val values = valuesReader(page.getDataEncoding, ValuesType.VALUES, dictionary)
     values.initFromPage(page.getValueCount, page.getData.toInputStream)
-
-    decodeValues(page.getValueCount, repetitionLevels, definitionLevels, values, target, offset)
+    scalarDecodeValues(page.getValueCount, rl, dl, values, target, offset)
   }
 
-  private def decodeValues(
+  /** Row-at-a-time decode loop — the generic scalar fallback. */
+  protected final def scalarDecodeValues(
       valueCount: Int,
-      repetitionLevels: IntIterator,
-      definitionLevels: IntIterator,
+      rl: IntIterator,
+      dl: IntIterator,
       values: ValuesReader,
       target: Array[A],
       offset: Int
   ): Int = {
-    val requiredDefinitionLevel = descriptor.getMaxDefinitionLevel
-    var targetIndex = offset
-    var valueIndex = 0
-
-    while (valueIndex < valueCount) {
-      val repetitionLevel = repetitionLevels.nextInt()
-      if (repetitionLevel != 0) {
-        throw new IllegalArgumentException(s"Unsupported repeated Parquet field: $columnName")
-      }
-
-      val definitionLevel = definitionLevels.nextInt()
-      if (definitionLevel < requiredDefinitionLevel) {
-        throw new IllegalArgumentException(s"Null values are not supported for $columnName")
-      }
-
-      target(targetIndex) = decodeValue(values)
-      targetIndex += 1
-      valueIndex += 1
+    var idx = offset
+    var i   = 0
+    while (i < valueCount) {
+      requireNonRepeatedNonNull(rl.nextInt(), dl.nextInt())
+      target(idx) = decodeValue(values)
+      idx += 1
+      i   += 1
     }
-
-    targetIndex
+    idx
   }
-
-  private def valuesReader(
-      encoding: Encoding,
-      valuesType: ValuesType,
-      dictionary: Option[Dictionary]
-  ): ValuesReader =
-    if (encoding.usesDictionary) {
-      val loadedDictionary = dictionary.getOrElse {
-        throw new ParquetDecodingException(s"Missing dictionary for $columnName and encoding $encoding")
-      }
-      encoding.getDictionaryBasedValuesReader(descriptor, valuesType, loadedDictionary)
-    } else {
-      encoding.getValuesReader(descriptor, valuesType)
-    }
-
-  private def rleIterator(maxLevel: Int, bytes: BytesInput): IntIterator =
-    if (maxLevel == 0) {
-      ZeroIntIterator
-    } else {
-      new RleIntIterator(
-        new RunLengthBitPackingHybridDecoder(BytesUtils.getWidthFromMaxInt(maxLevel), bytes.toInputStream)
-      )
-    }
 }
+
+// ---------------------------------------------------------------------------
+// Scalar Long decoder — supports PLAIN, DELTA_BINARY_PACKED, etc.
+// ---------------------------------------------------------------------------
 
 final class LongColumnChunkDecoder(
     override val columnName: String,
     override val descriptor: ColumnDescriptor
 ) extends PageLevelColumnChunkDecoder[Long](columnName, descriptor) {
+
   private val primitiveType = descriptor.getPrimitiveType.getPrimitiveTypeName
 
   override def supports(columnMeta: ColumnChunkMetaData): Boolean =
@@ -172,31 +140,205 @@ final class LongColumnChunkDecoder(
     primitiveType match {
       case PrimitiveType.PrimitiveTypeName.INT64 => reader.readLong()
       case PrimitiveType.PrimitiveTypeName.INT32 => reader.readInteger().toLong
-      case other =>
-        throw new IllegalArgumentException(s"Unsupported integer type for $columnName: $other")
+      case other => throw new IllegalArgumentException(s"Unsupported integer type for $columnName: $other")
     }
 }
+
+// ---------------------------------------------------------------------------
+// Scalar dictionary-optimised Long decoder
+// ---------------------------------------------------------------------------
+
+final class DictionaryLongColumnChunkDecoder(
+    override val columnName: String,
+    override val descriptor: ColumnDescriptor
+) extends PageLevelColumnChunkDecoder[Long](columnName, descriptor) {
+
+  import java.io.DataInputStream
+  import org.apache.parquet.bytes.BytesUtils
+  import org.apache.parquet.column.values.bitpacking.Packer
+
+  private val primitiveType = descriptor.getPrimitiveType.getPrimitiveTypeName
+
+  override def supports(columnMeta: ColumnChunkMetaData): Boolean =
+    columnMeta.getPrimitiveType.getPrimitiveTypeName == descriptor.getPrimitiveType.getPrimitiveTypeName &&
+      columnMeta.getEncodings.asScala.exists(_.usesDictionary)
+
+  override protected def decodeValue(reader: ValuesReader): Long =
+    primitiveType match {
+      case PrimitiveType.PrimitiveTypeName.INT64 => reader.readLong()
+      case PrimitiveType.PrimitiveTypeName.INT32 => reader.readInteger().toLong
+      case other => throw new IllegalArgumentException(s"Unsupported integer type for $columnName: $other")
+    }
+
+  override protected def decodePageV1(
+      page: DataPageV1,
+      dictionary: Option[Dictionary],
+      target: Array[Long],
+      offset: Int
+  ): Int = {
+    val input      = page.getBytes.toInputStream
+    val valueCount = page.getValueCount
+    val rl = valuesReader(page.getRlEncoding, ValuesType.REPETITION_LEVEL, dictionary)
+    rl.initFromPage(valueCount, input)
+    val dl = valuesReader(page.getDlEncoding, ValuesType.DEFINITION_LEVEL, dictionary)
+    dl.initFromPage(valueCount, input)
+
+    val pageNullCount = Option(page.getStatistics).filter(_.isNumNullsSet).map(_.getNumNulls).getOrElse(-1L)
+    if (dictionary.isDefined && canBulkDecode(pageNullCount))
+      return bulkDecodeDictionaryPage(valueCount, dictionary.get, input, target, offset)
+
+    val values = valuesReader(page.getValueEncoding, ValuesType.VALUES, dictionary)
+    values.initFromPage(valueCount, input)
+    decodeDictionaryValues(
+      valueCount,
+      new ValuesReaderIntIterator(rl),
+      new ValuesReaderIntIterator(dl),
+      dictionary, values, target, offset
+    )
+  }
+
+  override protected def decodePageV2(
+      page: DataPageV2,
+      dictionary: Option[Dictionary],
+      target: Array[Long],
+      offset: Int
+  ): Int = {
+    if (dictionary.isDefined && canBulkDecode(page.getNullCount.toLong))
+      return bulkDecodeDictionaryPage(page.getValueCount, dictionary.get, page.getData.toInputStream, target, offset)
+
+    val rl     = rleIterator(descriptor.getMaxRepetitionLevel, page.getRepetitionLevels)
+    val dl     = rleIterator(descriptor.getMaxDefinitionLevel, page.getDefinitionLevels)
+    val values = valuesReader(page.getDataEncoding, ValuesType.VALUES, dictionary)
+    values.initFromPage(page.getValueCount, page.getData.toInputStream)
+    decodeDictionaryValues(page.getValueCount, rl, dl, dictionary, values, target, offset)
+  }
+
+  // -- dictionary-aware scalar loop --
+
+  private def decodeDictionaryValues(
+      valueCount: Int,
+      rl: IntIterator,
+      dl: IntIterator,
+      dictionary: Option[Dictionary],
+      values: ValuesReader,
+      target: Array[Long],
+      offset: Int
+  ): Int = {
+    val dictReader = values match {
+      case r: DictionaryValuesReader => r
+      case _ => return scalarDecodeValues(valueCount, rl, dl, values, target, offset)
+    }
+    val dict = dictionary.getOrElse {
+      return scalarDecodeValues(valueCount, rl, dl, values, target, offset)
+    }
+
+    val dictValues = materializeDictionary(dict)
+    var idx = offset
+    var i   = 0
+    while (i < valueCount) {
+      requireNonRepeatedNonNull(rl.nextInt(), dl.nextInt())
+      target(idx) = dictValues(dictReader.readValueDictionaryId())
+      idx += 1
+      i   += 1
+    }
+    idx
+  }
+
+  // -- bulk dictionary decode (skips rep/def) --
+
+  private def canBulkDecode(pageNullCount: Long): Boolean =
+    descriptor.getMaxRepetitionLevel == 0 && pageNullCount == 0
+
+  @nowarn("msg=deprecated")
+  private def bulkDecodeDictionaryPage(
+      valueCount: Int,
+      dictionary: Dictionary,
+      data: java.io.InputStream,
+      target: Array[Long],
+      offset: Int
+  ): Int = {
+    val dictValues = materializeDictionary(dictionary)
+    val bitWidth   = BytesUtils.readIntLittleEndianOnOneByte(data)
+    if (bitWidth == 0) {
+      java.util.Arrays.fill(target, offset, offset + valueCount, dictValues(0))
+      return offset + valueCount
+    }
+
+    val packer    = Packer.LITTLE_ENDIAN.newBytePacker(bitWidth)
+    val packedIds = new Array[Int](8)
+    var targetIdx = offset
+    var remaining = valueCount
+
+    while (remaining > 0) {
+      val header = BytesUtils.readUnsignedVarInt(data)
+      if ((header & 1) == 0) {
+        val runLength    = header >>> 1
+        val decodedValue = dictValues(BytesUtils.readIntLittleEndianPaddedOnBitWidth(data, bitWidth))
+        java.util.Arrays.fill(target, targetIdx, targetIdx + runLength, decodedValue)
+        targetIdx += runLength
+        remaining -= runLength
+      } else {
+        val groupCount     = header >>> 1
+        val packedByteCount = groupCount * bitWidth
+        val packedBytes    = new Array[Byte](packedByteCount)
+        new DataInputStream(data).readFully(packedBytes)
+
+        var gi = 0; var bi = 0
+        while (gi < groupCount && remaining > 0) {
+          packer.unpack8Values(packedBytes, bi, packedIds, 0)
+          var id = 0
+          while (id < 8 && remaining > 0) {
+            target(targetIdx) = dictValues(packedIds(id))
+            targetIdx += 1; remaining -= 1; id += 1
+          }
+          gi += 1; bi += bitWidth
+        }
+      }
+    }
+    targetIdx
+  }
+
+  private def materializeDictionary(dictionary: Dictionary): Array[Long] = {
+    val max    = dictionary.getMaxId
+    val values = new Array[Long](max + 1)
+    var i = 0
+    while (i <= max) {
+      values(i) = primitiveType match {
+        case PrimitiveType.PrimitiveTypeName.INT64 => dictionary.decodeToLong(i)
+        case PrimitiveType.PrimitiveTypeName.INT32 => dictionary.decodeToInt(i).toLong
+        case other => throw new IllegalArgumentException(s"Unsupported integer type for $columnName: $other")
+      }
+      i += 1
+    }
+    values
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Scalar Double decoder — supports PLAIN, DECIMAL, FLOAT, etc.
+// ---------------------------------------------------------------------------
 
 final class DoubleColumnChunkDecoder(
     override val columnName: String,
     override val descriptor: ColumnDescriptor
 ) extends PageLevelColumnChunkDecoder[Double](columnName, descriptor) {
+
   private val primitiveType = descriptor.getPrimitiveType.getPrimitiveTypeName
-  private val logicalType = descriptor.getPrimitiveType.getLogicalTypeAnnotation
+  private val logicalType   = descriptor.getPrimitiveType.getLogicalTypeAnnotation
 
   override def supports(columnMeta: ColumnChunkMetaData): Boolean =
     columnMeta.getPrimitiveType == descriptor.getPrimitiveType
 
   override protected def decodeValue(reader: ValuesReader): Double =
     (logicalType, primitiveType) match {
-      case (decimal: LogicalTypeAnnotation.DecimalLogicalTypeAnnotation, PrimitiveType.PrimitiveTypeName.BINARY) =>
-        decimalFromBinary(reader.readBytes(), decimal.getScale)
-      case (decimal: LogicalTypeAnnotation.DecimalLogicalTypeAnnotation, PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY) =>
-        decimalFromBinary(reader.readBytes(), decimal.getScale)
-      case (decimal: LogicalTypeAnnotation.DecimalLogicalTypeAnnotation, PrimitiveType.PrimitiveTypeName.INT32) =>
-        JBigDecimal.valueOf(reader.readInteger().toLong, decimal.getScale).doubleValue()
-      case (decimal: LogicalTypeAnnotation.DecimalLogicalTypeAnnotation, PrimitiveType.PrimitiveTypeName.INT64) =>
-        JBigDecimal.valueOf(reader.readLong(), decimal.getScale).doubleValue()
+      case (d: LogicalTypeAnnotation.DecimalLogicalTypeAnnotation, PrimitiveType.PrimitiveTypeName.BINARY) =>
+        DecimalConversions.decimalFromBinary(reader.readBytes(), d.getScale)
+      case (d: LogicalTypeAnnotation.DecimalLogicalTypeAnnotation, PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY) =>
+        DecimalConversions.fixedLengthDecimalToDouble(reader.readBytes(), d.getScale)
+      case (d: LogicalTypeAnnotation.DecimalLogicalTypeAnnotation, PrimitiveType.PrimitiveTypeName.INT32) =>
+        JBigDecimal.valueOf(reader.readInteger().toLong, d.getScale).doubleValue()
+      case (d: LogicalTypeAnnotation.DecimalLogicalTypeAnnotation, PrimitiveType.PrimitiveTypeName.INT64) =>
+        JBigDecimal.valueOf(reader.readLong(), d.getScale).doubleValue()
       case (_, PrimitiveType.PrimitiveTypeName.DOUBLE) =>
         reader.readDouble()
       case (_, PrimitiveType.PrimitiveTypeName.FLOAT) =>
@@ -204,28 +346,5 @@ final class DoubleColumnChunkDecoder(
       case other =>
         throw new IllegalArgumentException(s"Unsupported revenue type for $columnName: $other")
     }
-
-  private def decimalFromBinary(binary: Binary, scale: Int): Double =
-    new JBigDecimal(new BigInteger(binary.getBytesUnsafe), scale).doubleValue()
 }
 
-private[parquet] sealed trait IntIterator {
-  def nextInt(): Int
-}
-
-private[parquet] object ZeroIntIterator extends IntIterator {
-  override def nextInt(): Int = 0
-}
-
-private[parquet] final class RleIntIterator(decoder: RunLengthBitPackingHybridDecoder) extends IntIterator {
-  override def nextInt(): Int =
-    try {
-      decoder.readInt()
-    } catch {
-      case error: java.io.IOException => throw new ParquetDecodingException(error)
-    }
-}
-
-private[parquet] final class ValuesReaderIntIterator(reader: ValuesReader) extends IntIterator {
-  override def nextInt(): Int = reader.readInteger()
-}

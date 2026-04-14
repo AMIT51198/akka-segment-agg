@@ -1,114 +1,129 @@
 package com.example.segmentagg
 
-import java.time.Instant
 import java.nio.ByteBuffer
 import java.nio.channels.SeekableByteChannel
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path, StandardOpenOption}
+import java.time.Instant
 
 import akka.NotUsed
 import akka.stream.scaladsl.Source
+
+import com.example.segmentagg.logging.PipelineLogger
+import com.example.segmentagg.metrics.LatencyDistribution
 import org.apache.arrow.memory.RootAllocator
 import org.apache.arrow.vector._
 import org.apache.arrow.vector.ipc.{ArrowFileReader, ArrowReader, ArrowStreamReader, SeekableReadChannel}
 
+/**
+ * Akka Streams source that reads columnar batches from an Arrow IPC file/stream.
+ *
+ * Design notes:
+ *  - Uses [[PipelineLogger]] for structured logging (Dependency Inversion).
+ *  - The internal [[Cursor]] encapsulates all file I/O and vector access,
+ *    keeping the public API minimal (Interface Segregation).
+ */
 object ArrowBatchSource {
 
-  def source(path: Path): Source[ColumnBatch, NotUsed] = {
-    Source
-      .unfoldResource[ColumnBatch, Cursor](
-        create = () => Cursor.open(path),
-        read = _.nextBatch(),
-        close = _.close()
-      )
-  }
+  /** Create a source that emits one [[ColumnBatch]] per Arrow record batch. */
+  def source(path: Path, logger: PipelineLogger): Source[ColumnBatch, NotUsed] =
+    Source.unfoldResource[ColumnBatch, Cursor](
+      create = () => Cursor.open(path, logger),
+      read   = _.nextBatch(),
+      close  = _.close()
+    )
 
-  final class Cursor private (
+  // -- internal cursor --
+
+  private final class Cursor(
       channel: SeekableByteChannel,
       allocator: RootAllocator,
       reader: ArrowReader,
-      path: Path
+      path: Path,
+      logger: PipelineLogger
   ) {
-    private val BatchLogInterval = 100
-    private var batchIndex = 0
-    private var firstScanLogged = false
-    private var totalScanNanos = 0L
+    private val BatchLogInterval      = 100
+    private var batchIndex            = 0
+    private var firstScanLogged       = false
+    private var totalScanNanos        = 0L
     private var totalMaterializeNanos = 0L
 
     def nextBatch(): Option[ColumnBatch] = {
       if (!firstScanLogged) {
         firstScanLogged = true
-        println(s"[ArrowBatchSource] First scan starting at ${Instant.now()} for $path")
+        logger.info(s"First scan starting at ${Instant.now()} for $path")
       }
 
       val scanStart = System.nanoTime()
-      val hasBatch = reader.loadNextBatch()
+      val hasBatch  = reader.loadNextBatch()
       val scanNanos = System.nanoTime() - scanStart
       totalScanNanos += scanNanos
 
       if (!hasBatch) {
-        println(
-          s"[ArrowBatchSource] Reached end of input after $batchIndex batches from $path " +
-            s"(total scan=${formatMillis(totalScanNanos)}, total materialize=${formatMillis(totalMaterializeNanos)})"
+        logger.info(
+          s"Reached end of input after $batchIndex batches from $path " +
+            s"(total scan=${LatencyDistribution.formatMillis(totalScanNanos)}, " +
+            s"total materialize=${LatencyDistribution.formatMillis(totalMaterializeNanos)})"
         )
         None
       } else {
-        val root = reader.getVectorSchemaRoot
+        val root     = reader.getVectorSchemaRoot
         val rowCount = root.getRowCount
         batchIndex += 1
+
         val materializeStart = System.nanoTime()
         val batch =
-          if (rowCount == 0) {
-            ColumnBatch.empty.copy(batchId = batchIndex)
-          } else {
-            copyBatch(root, rowCount)
-          }
+          if (rowCount == 0) ColumnBatch.Empty.copy(batchId = batchIndex)
+          else copyBatch(root, rowCount)
         val materializeNanos = System.nanoTime() - materializeStart
         totalMaterializeNanos += materializeNanos
 
         if (batchIndex <= 5 || batchIndex % BatchLogInterval == 0 || rowCount == 0) {
-          println(
-            s"[ArrowBatchSource] Loaded batch #$batchIndex with $rowCount rows from $path " +
-              s"(scan=${formatMillis(scanNanos)}, materialize=${formatMillis(materializeNanos)})"
+          logger.info(
+            s"Loaded batch #$batchIndex with $rowCount rows from $path " +
+              s"(scan=${LatencyDistribution.formatMillis(scanNanos)}, " +
+              s"materialize=${LatencyDistribution.formatMillis(materializeNanos)})"
           )
         }
-
         Some(batch)
       }
     }
 
     def close(): Unit = {
-      println(s"[ArrowBatchSource] Closing input resources for $path")
+      logger.info(s"Closing input resources for $path")
       reader.close()
       allocator.close()
       channel.close()
     }
 
+    // -- batch materialisation --
+
     private def copyBatch(root: VectorSchemaRoot, rowCount: Int): ColumnBatch = {
-      val segmentVector = root.getVector("segment_id")
-      val impressionsVector = root.getVector("impressions")
-      val revenueVector = root.getVector("revenue")
+      val segmentVector     = requireVector(root, "segment_id")
+      val impressionsVector = requireVector(root, "impressions")
+      val revenueVector     = requireVector(root, "revenue")
 
-      require(segmentVector != null, "Missing Arrow column: segment_id")
-      require(impressionsVector != null, "Missing Arrow column: impressions")
-      require(revenueVector != null, "Missing Arrow column: revenue")
-
-      val segmentIds = new Array[Long](rowCount)
+      val segmentIds  = new Array[Long](rowCount)
       val impressions = new Array[Long](rowCount)
-      val revenues = new Array[Double](rowCount)
+      val revenues    = new Array[Double](rowCount)
 
       var i = 0
       while (i < rowCount) {
-        if (segmentVector.isNull(i) || impressionsVector.isNull(i) || revenueVector.isNull(i)) {
+        if (segmentVector.isNull(i) || impressionsVector.isNull(i) || revenueVector.isNull(i))
           throw new IllegalArgumentException(s"Nulls are not supported in the hot path, found at row index $i")
-        }
-        segmentIds(i) = readLong(segmentVector, i)
+        segmentIds(i)  = readLong(segmentVector, i)
         impressions(i) = readLong(impressionsVector, i)
-        revenues(i) = readDouble(revenueVector, i)
+        revenues(i)    = readDouble(revenueVector, i)
         i += 1
       }
 
-      ColumnBatch(segmentIds, impressions, revenues, rowCount, batchIndex, 0L, 0L)
+      ColumnBatch(segmentIds, impressions, revenues, rowCount, batchIndex, BatchTiming.Zero)
+    }
+
+    private def requireVector(root: VectorSchemaRoot, name: String): FieldVector = {
+      val vec = root.getVector(name)
+      require(vec != null, s"Missing Arrow column: $name")
+      vec
     }
 
     private def readLong(vector: FieldVector, index: Int): Long = vector match {
@@ -134,39 +149,40 @@ object ArrowBatchSource {
           s"Unsupported Arrow floating vector type for ${vector.getName}: ${vector.getClass.getName}"
         )
     }
-
-    private def formatMillis(nanos: Long): String = f"${nanos / 1000000.0}%.2f ms"
   }
 
-  object Cursor {
-    def open(path: Path): Cursor = {
-      println(s"[ArrowBatchSource] Opening Arrow input $path")
-      val channel = Files.newByteChannel(path, StandardOpenOption.READ)
+  private object Cursor {
+    def open(path: Path, logger: PipelineLogger): Cursor = {
+      logger.info(s"Opening Arrow input $path")
+      val channel   = Files.newByteChannel(path, StandardOpenOption.READ)
       val allocator = new RootAllocator(Long.MaxValue)
-      val reader = createReader(path, channel, allocator)
-      new Cursor(channel, allocator, reader, path)
+      val reader    = createReader(path, channel, allocator, logger)
+      new Cursor(channel, allocator, reader, path, logger)
     }
 
-    private def createReader(path: Path, channel: SeekableByteChannel, allocator: RootAllocator): ArrowReader = {
+    private def createReader(
+        path: Path,
+        channel: SeekableByteChannel,
+        allocator: RootAllocator,
+        logger: PipelineLogger
+    ): ArrowReader =
       if (hasArrowFileMagic(channel)) {
-        println(s"[ArrowBatchSource] Detected Arrow file container format for $path")
+        logger.info(s"Detected Arrow file container format for $path")
         new ArrowFileReader(new SeekableReadChannel(channel), allocator)
       } else {
-        println(s"[ArrowBatchSource] Detected Arrow stream format for $path")
+        logger.info(s"Detected Arrow stream format for $path")
         new ArrowStreamReader(channel, allocator)
       }
-    }
 
     private def hasArrowFileMagic(channel: SeekableByteChannel): Boolean = {
       val expected = "ARROW1".getBytes(StandardCharsets.US_ASCII)
-      val header = ByteBuffer.allocate(expected.length)
+      val header   = ByteBuffer.allocate(expected.length)
       channel.position(0L)
       val bytesRead = channel.read(header)
       channel.position(0L)
 
-      if (bytesRead != expected.length) {
-        false
-      } else {
+      if (bytesRead != expected.length) false
+      else {
         header.flip()
         val actual = new Array[Byte](expected.length)
         header.get(actual)
@@ -175,3 +191,4 @@ object ArrowBatchSource {
     }
   }
 }
+

@@ -27,6 +27,14 @@ lazy val root = (project in file("."))
       "org.apache.parquet" % "parquet-hadoop" % parquetVersion,
       "org.apache.hadoop" % "hadoop-common" % hadoopVersion,
       "org.apache.hadoop" % "hadoop-mapreduce-client-core" % hadoopVersion,
-      "org.slf4j" % "slf4j-simple" % "2.0.16"
+      "org.slf4j" % "slf4j-simple" % "2.0.16",
+      // Test dependencies
+      "org.scalatest" %% "scalatest" % "3.2.18" % Test,
+      "com.typesafe.akka" %% "akka-stream-testkit" % akkaVersion % Test,
+      "com.typesafe.akka" %% "akka-actor-testkit-typed" % akkaVersion % Test
+    ),
+    Test / fork := true,
+    Test / javaOptions ++= Seq(
+      "--add-opens=java.base/java.nio=ALL-UNNAMED"
     )
   )
