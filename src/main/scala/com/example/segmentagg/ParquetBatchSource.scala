@@ -1,7 +1,7 @@
 package com.example.segmentagg
 
 import java.nio.file.{Files, Path}
-import java.util.concurrent.atomic.AtomicInteger
+import java.time.Instant
 
 import scala.jdk.CollectionConverters._
 import scala.util.Using
@@ -16,129 +16,71 @@ import org.apache.parquet.hadoop.metadata.ParquetMetadata
 import org.apache.parquet.hadoop.util.HadoopInputFile
 import org.apache.parquet.schema.{MessageType, Type}
 
-import com.example.segmentagg.logging.PipelineLogger
-import com.example.segmentagg.parquet.{DecodeMode, RequiredColumnDecoders}
+import com.example.segmentagg.parquet.ColumnDecoder
 
-/**
- * Akka Streams source that reads columnar batches from Parquet files.
- *
- * Resolves all row groups from the input path and emits one [[ColumnBatch]]
- * per row group. Decode strategy is plugged in via [[DecodeMode]].
- */
+/** Akka Streams source: emits one ColumnBatch per Parquet row group. */
 object ParquetBatchSource {
 
-  private val RequiredColumns: List[String] = List("segment_id", "impressions", "revenue")
+  private val Columns = List("segment_id", "impressions", "revenue")
 
-  /**
-   * The read plan for a single Parquet file — everything the row-group cursor
-   * needs to decode batches without re-reading the footer.
-   */
-  private final case class FileReadPlan(
+  private case class FilePlan(
       path: Path,
-      footer: ParquetMetadata,
       schema: MessageType,
-      decoders: RequiredColumnDecoders,
       rowGroupCount: Int,
-      batchIdStart: Int
+      segDecoder: ColumnDecoder[Long],
+      impDecoder: ColumnDecoder[Long],
+      revDecoder: ColumnDecoder[Double]
   )
 
-  /** Build a [[Source]] that emits one [[ColumnBatch]] per Parquet row group. */
-  def source(
-      input: Path,
-      readParallelism: Int,
-      decodeMode: DecodeMode = DecodeMode.Scalar,
-      logger: PipelineLogger = PipelineLogger.console("ParquetBatchSource")
-  ): Source[ColumnBatch, NotUsed] = {
-    val conf      = new Configuration(false)
-    val files     = resolveInputFiles(input)
-    val nextBatch = new AtomicInteger(0)
-    val plans     = files.map(buildReadPlan(_, conf, nextBatch, decodeMode))
-    val rgCount   = plans.map(_.rowGroupCount).sum
+  def source(input: Path, readParallelism: Int): Source[ColumnBatch, NotUsed] = {
+    val conf  = new Configuration(false)
+    val files = resolveFiles(input)
+    val plans = files.map(buildPlan(_, conf))
+    val total = plans.map(_.rowGroupCount).sum
 
-    logger.info(s"Resolved ${files.size} parquet files and $rgCount row groups from $input")
+    println(s"[${Instant.now()}] [ParquetBatchSource] INFO  Resolved ${files.size} parquet files and $total row groups from $input")
 
     Source(plans)
       .addAttributes(Attributes.inputBuffer(initial = 1, max = 1))
       .flatMapMerge(
-        breadth = math.max(1, math.min(readParallelism, plans.size)),
-        f = plan => rowGroupSource(plan, conf)
+        breadth = math.min(readParallelism, plans.size).max(1),
+        plan => rowGroupSource(plan, conf)
       )
       .addAttributes(Attributes.inputBuffer(initial = 1, max = 1))
   }
 
-  // -- read plan construction --
+  private def buildPlan(path: Path, conf: Configuration): FilePlan = {
+    val inputFile = HadoopInputFile.fromPath(hadoopPath(path), conf)
+    val footer    = Using.resource(ParquetFileReader.open(inputFile, readOpts(conf, path)))(_.getFooter)
+    val schema    = projectSchema(footer.getFileMetaData.getSchema)
 
-  private def buildReadPlan(
-      path: Path,
-      conf: Configuration,
-      nextBatchId: AtomicInteger,
-      decodeMode: DecodeMode
-  ): FileReadPlan = {
-    val inputFile    = HadoopInputFile.fromPath(hadoopPath(path), conf)
-    val footer       = Using.resource(ParquetFileReader.open(inputFile, readOptions(conf, path)))(_.getFooter)
-    val schema       = projectedSchema(footer.getFileMetaData.getSchema)
-    val decoders     = RequiredColumnDecoders.build(footer, schema, decodeMode)
-    val rowGroupCnt  = footer.getBlocks.size
-    val batchIdStart = nextBatchId.getAndAdd(rowGroupCnt)
-    FileReadPlan(path, footer, schema, decoders, rowGroupCnt, batchIdStart)
+    FilePlan(
+      path         = path,
+      schema       = schema,
+      rowGroupCount = footer.getBlocks.size,
+      segDecoder   = ColumnDecoder.forLong("segment_id", schema),
+      impDecoder   = ColumnDecoder.forLong("impressions", schema),
+      revDecoder   = ColumnDecoder.forDouble("revenue", schema)
+    )
   }
 
-  // -- schema helpers --
+  private def rowGroupSource(plan: FilePlan, conf: Configuration): Source[ColumnBatch, NotUsed] =
+    Source.unfoldResource[ColumnBatch, RowGroupCursor](
+      create = () => RowGroupCursor.open(plan, conf),
+      read   = _.next(),
+      close  = _.close()
+    ).addAttributes(Attributes.inputBuffer(initial = 1, max = 1))
 
-  private def projectedSchema(fileSchema: MessageType): MessageType =
-    new MessageType(fileSchema.getName, RequiredColumns.map(requiredField(fileSchema, _)).asJava)
+  private final class RowGroupCursor(plan: FilePlan, reader: ParquetFileReader) {
+    private var idx = 0
 
-  private def requiredField(fileSchema: MessageType, name: String): Type =
-    fileSchema.getFields.asScala
-      .find(_.getName == name)
-      .getOrElse(throw new IllegalArgumentException(s"Missing Parquet column: $name"))
+    def next(): Option[ColumnBatch] = {
+      if (idx >= plan.rowGroupCount) return None
+      idx += 1
 
-  // -- Hadoop path helpers --
-
-  private def hadoopPath(path: Path): org.apache.hadoop.fs.Path =
-    new org.apache.hadoop.fs.Path(path.toUri)
-
-  private def readOptions(conf: Configuration, path: Path) =
-    HadoopReadOptions.builder(conf, hadoopPath(path)).build()
-
-  // -- file resolution --
-
-  private def resolveInputFiles(input: Path): List[Path] =
-    if (Files.isRegularFile(input)) {
-      List(input)
-    } else if (Files.isDirectory(input)) {
-      Using.resource(Files.walk(input)) { stream =>
-        stream.iterator().asScala
-          .filter(p => Files.isRegularFile(p) && p.getFileName.toString.toLowerCase.endsWith(".parquet"))
-          .toList
-          .sorted
-      }
-    } else {
-      throw new IllegalArgumentException(s"Input path does not exist or is unsupported: $input")
-    }
-
-  // -- row-group cursor (encapsulates mutable reader state) --
-
-  private final class RowGroupCursor(file: FileReadPlan, reader: ParquetFileReader) {
-    private var nextIndex = 0
-
-    def nextBatch(): Option[ColumnBatch] =
-      if (nextIndex >= file.rowGroupCount) None
-      else {
-        val idx = nextIndex
-        nextIndex += 1
-        Some(readRowGroup(idx))
-      }
-
-    def close(): Unit = reader.close()
-
-    private def readRowGroup(rowGroupIndex: Int): ColumnBatch = {
       val fetchStart = System.nanoTime()
-      val pages      = reader.readRowGroup(rowGroupIndex)
+      val pages      = reader.readRowGroup(idx - 1)
       val fetchEnd   = System.nanoTime()
-
-      if (pages == null)
-        throw new IllegalStateException(s"Parquet row group $rowGroupIndex could not be read from ${file.path}")
 
       try {
         val rowCount    = pages.getRowCount.toInt
@@ -146,43 +88,46 @@ object ParquetBatchSource {
         val impressions = new Array[Long](rowCount)
         val revenues    = new Array[Double](rowCount)
 
-        file.decoders.segmentIds.decode(pages, segmentIds, rowCount)
-        val segDecodeEnd = System.nanoTime()
-
-        file.decoders.impressions.decode(pages, impressions, rowCount)
-        val impDecodeEnd = System.nanoTime()
-
-        file.decoders.revenues.decode(pages, revenues, rowCount)
+        plan.segDecoder.decode(pages, segmentIds, rowCount)
+        plan.impDecoder.decode(pages, impressions, rowCount)
+        plan.revDecoder.decode(pages, revenues, rowCount)
         val decodeEnd = System.nanoTime()
 
-        ColumnBatch(
-          segmentIds, impressions, revenues,
-          size    = rowCount,
-          batchId = file.batchIdStart + rowGroupIndex + 1,
-          timing  = BatchTiming(fetchStart, fetchEnd, segDecodeEnd, impDecodeEnd, decodeEnd)
-        )
+        Some(ColumnBatch(segmentIds, impressions, revenues, rowCount, BatchTiming(fetchStart, fetchEnd, decodeEnd)))
       } finally {
         pages.close()
       }
     }
+
+    def close(): Unit = reader.close()
   }
 
   private object RowGroupCursor {
-    def open(file: FileReadPlan, conf: Configuration): RowGroupCursor = {
-      val inputFile = HadoopInputFile.fromPath(hadoopPath(file.path), conf)
-      val reader    = ParquetFileReader.open(inputFile, readOptions(conf, file.path))
-      reader.setRequestedSchema(file.schema)
-      new RowGroupCursor(file, reader)
+    def open(plan: FilePlan, conf: Configuration): RowGroupCursor = {
+      val inputFile = HadoopInputFile.fromPath(hadoopPath(plan.path), conf)
+      val reader    = ParquetFileReader.open(inputFile, readOpts(conf, plan.path))
+      reader.setRequestedSchema(plan.schema)
+      new RowGroupCursor(plan, reader)
     }
   }
 
-  private def rowGroupSource(file: FileReadPlan, conf: Configuration): Source[ColumnBatch, NotUsed] =
-    Source
-      .unfoldResource[ColumnBatch, RowGroupCursor](
-        create = () => RowGroupCursor.open(file, conf),
-        read   = _.nextBatch(),
-        close  = _.close()
-      )
-      .addAttributes(Attributes.inputBuffer(initial = 1, max = 1))
+  private def resolveFiles(input: Path): List[Path] =
+    if (Files.isRegularFile(input)) List(input)
+    else if (Files.isDirectory(input))
+      Using.resource(Files.walk(input)) { stream =>
+        stream.iterator().asScala
+          .filter(p => Files.isRegularFile(p) && p.toString.toLowerCase.endsWith(".parquet"))
+          .toList.sorted
+      }
+    else throw new IllegalArgumentException(s"Input path does not exist: $input")
+
+  private def projectSchema(fileSchema: MessageType): MessageType =
+    new MessageType(fileSchema.getName, Columns.map { name =>
+      fileSchema.getFields.asScala.find(_.getName == name)
+        .getOrElse(throw new IllegalArgumentException(s"Missing column: $name"))
+    }.asJava)
+
+  private def hadoopPath(p: Path) = new org.apache.hadoop.fs.Path(p.toUri)
+  private def readOpts(conf: Configuration, p: Path) = HadoopReadOptions.builder(conf, hadoopPath(p)).build()
 }
 
