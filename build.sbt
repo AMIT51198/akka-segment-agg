@@ -12,7 +12,12 @@ lazy val root = (project in file("."))
     Compile / mainClass := Some("com.example.segmentagg.Main"),
     Compile / run / fork := true,
     Test / fork := true,
-    Compile / run / javaOptions ++= Seq("-Xmx4g", "-XX:+UseG1GC"),
+    Compile / run / javaOptions ++= Seq(
+      "-Xmx4g", "-XX:+UseG1GC",
+      "-Dorg.slf4j.simpleLogger.log.org.apache.hadoop=warn",
+      "-Dorg.slf4j.simpleLogger.log.org.apache.parquet=warn",
+      "-Dorg.slf4j.simpleLogger.log.akka=warn"
+    ),
     Test / javaOptions ++= Seq("-Xmx2g"),
     libraryDependencies ++= Seq(
       "com.typesafe.akka" %% "akka-actor-typed" % akkaVersion,
