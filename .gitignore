@@ -2,6 +2,8 @@
 target/
 project/target/
 project/project/target/
+dist/
+build/
 
 # ---- sbt metadata ----
 .bsp/
@@ -12,6 +14,8 @@ project/.bloop/
 # ---- compiled class files ----
 *.class
 *.jar
+*.war
+*.ear
 
 # ---- IDE ----
 .idea/
@@ -20,18 +24,76 @@ project/.bloop/
 *.iws
 *.ipr
 .vscode/
+.vscode-insiders/
+*.swp
+*.swo
+*~
+.sublime-project
+.sublime-workspace
 
 # ---- OS ----
 .DS_Store
 Thumbs.db
+*.tmp
+*.bak
 
-# ---- CSV output files (pipeline results, benchmark outputs) ----
+# ---- Environment & Secrets ----
+.env
+.env.local
+.env.*.local
+secrets/
+credentials.json
+
+# ---- Data & Results ----
 *.csv
-src/main/resources/
+*.parquet
+data/
+output/
+results/
+src/main/resources/*.csv
+logs/
 
-# ---- benchmark output ----
+# ---- Benchmark outputs ----
 /tmp/benchmark_results.csv
 /tmp/benchmark_dummy.csv
+/tmp/benchmark_run.log
+benchmarks/
 
-# ---- logs ----
+# ---- Docker & Deployment ----
+docker-compose.override.yml
+*.pem
+*.key
+deployment/k8s/secrets/
+
+# ---- Logs ----
 *.log
+*.log.*
+logs/
+*.gz
+*.tar
+
+# ---- Python / Jupyter ----
+__pycache__/
+*.py[cod]
+*$py.class
+.jupyter/
+.ipynb_checkpoints/
+
+# ---- Generated files ----
+*.class
+*.ctxt
+.mtj.tmp/
+*.jar
+*.war
+*.nar
+*.ear
+*.zip
+*.tar.gz
+*.rar
+
+# ---- System files ----
+.AppleDouble
+.LSOverride
+._*
+.apdisk
+

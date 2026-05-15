@@ -8,9 +8,8 @@ import org.apache.parquet.column.ColumnDescriptor
 import org.apache.parquet.column.page.{DataPage, DataPageV1, DataPageV2, PageReadStore}
 import org.apache.parquet.column.values.ValuesReader
 import org.apache.parquet.column.values.dictionary.DictionaryValuesReader
-import org.apache.parquet.column.{Dictionary, Encoding, ValuesType}
+import org.apache.parquet.column.{Dictionary, ValuesType}
 import org.apache.parquet.hadoop.metadata.ColumnChunkMetaData
-import org.apache.parquet.io.api.Binary
 import org.apache.parquet.schema.{LogicalTypeAnnotation, PrimitiveType}
 
 import scala.jdk.CollectionConverters._
@@ -224,24 +223,24 @@ final class DictionaryLongColumnChunkDecoder(
       target: Array[Long],
       offset: Int
   ): Int = {
-    val dictReader = values match {
-      case r: DictionaryValuesReader => r
-      case _ => return scalarDecodeValues(valueCount, rl, dl, values, target, offset)
-    }
-    val dict = dictionary.getOrElse {
-      return scalarDecodeValues(valueCount, rl, dl, values, target, offset)
-    }
-
-    val dictValues = materializeDictionary(dict)
-    var idx = offset
-    var i   = 0
-    while (i < valueCount) {
-      requireNonRepeatedNonNull(rl.nextInt(), dl.nextInt())
-      target(idx) = dictValues(dictReader.readValueDictionaryId())
-      idx += 1
-      i   += 1
-    }
-    idx
+    (for {
+      dictReader <- values match {
+        case r: DictionaryValuesReader => Some(r)
+        case _ => None
+      }
+      dict <- dictionary
+    } yield {
+      val dictValues = materializeDictionary(dict)
+      var idx = offset
+      var i   = 0
+      while (i < valueCount) {
+        requireNonRepeatedNonNull(rl.nextInt(), dl.nextInt())
+        target(idx) = dictValues(dictReader.readValueDictionaryId())
+        idx += 1
+        i   += 1
+      }
+      idx
+    }).getOrElse(scalarDecodeValues(valueCount, rl, dl, values, target, offset))
   }
 
   // -- bulk dictionary decode (skips rep/def) --
