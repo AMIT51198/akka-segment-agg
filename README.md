@@ -1,199 +1,184 @@
 # Akka Segment Aggregation
 
-A single-node streaming pipeline that executes the following aggregation over a large Parquet dataset:
+High-performance streaming pipeline that processes Parquet data and executes:
 
 ```sql
-SELECT
-    segment_id,
-    SUM(impressions) AS total_impressions,
-    SUM(revenue)     AS total_revenue
+SELECT segment_id, SUM(impressions) AS total_impressions, SUM(revenue) AS total_revenue
 FROM fact_events
 GROUP BY segment_id;
 ```
 
-The pipeline reads columnar Parquet data, decodes only the three required columns, partially aggregates each row group in parallel, and merges the results into a final grouped output written to CSV.
+**Performance**: 500M rows in ~54 seconds on 12-core system (read=12, agg=12)
 
----
+## Quick Start
 
-## Generating the Input Data
+```bash
+# Compile
+sbt clean compile
 
-Use [DuckDB](https://duckdb.org/) to generate a synthetic `fact_events` table and export it to Parquet.
+# Run
+sbt "run --input /path/to/parquet --output /path/to/results.csv --read-parallelism 8 --aggregate-parallelism 8"
 
-```sql
--- Generate 500M rows with high-cardinality, hash-distributed values.
--- segment_id:  up to 10M unique values, randomly distributed (no sequential pattern).
--- impressions: random integer 1–1000 (defeats RLE/dictionary encoding).
--- revenue:     near-unique double (full floating-point entropy, defeats compression).
-CREATE TABLE fact_events AS
-SELECT
-    ABS(hash(i)     % 10000000)                                          AS segment_id,
-    (ABS(hash(i+1)  % 1000) + 1)                                        AS impressions,
-    ABS(hash(i+2)   % 999999) * 0.00000100001
-        + ABS(hash(i+3) % 9973) * 0.001                                 AS revenue
-FROM range(500000000) t(i);
-
--- Export to partitioned Parquet files.
-COPY fact_events
-TO '/path/to/fact_events_parquet'
-(FORMAT parquet, ROW_GROUP_SIZE 65536);
+# Test
+sbt test
 ```
-
-> The data is deliberately designed to be hard to compress: random segment IDs break sort-based
-> optimisations, a wide impression range defeats RLE, and near-unique doubles defeat dictionary encoding.
-> This gives a realistic worst-case benchmark for the aggregation pipeline.
-
----
 
 ## Pipeline Architecture
 
 ```
-Parquet directory
-       │
-       ▼
-ParquetBatchSource          (readParallelism=N concurrent file readers)
-       │  one ColumnBatch per row group
-       ▼
-filter(non-empty batches)
-       │
-       ▼
-mapAsyncUnordered           (aggregateParallelism=M concurrent workers)
-       │  each worker: decode columns → PartialAggregate (LongMap)
-       ▼
-Sink.fold                   (single thread, sequential merge)
-       │  merges all PartialAggregates into one
-       ▼
-reportResults               (materialise rows, log timing & latency metrics)
-       │
-       ▼
-ResultWriter                (CsvResultWriter or NoOpResultWriter for benchmarks)
+Parquet Files (16 files, 7631 row groups)
+     ↓
+Read Stage (N threads) → ParquetBatchSource
+     ↓
+Decode Stage (M threads) → ColumnBatch (segment_ids[], impressions[], revenues[])
+     ↓
+Aggregate Stage (M threads) → PartialAggregate (LongMap)
+     ↓
+Merge Stage (1 thread) → Final result
+     ↓
+Output CSV (segment_id, total_impressions, total_revenue)
 ```
 
-### Key components
+## Parallelism
 
-| Component | Package | Role |
-|---|---|---|
-| `ParquetBatchSource` | `segmentagg` | Resolves Parquet files, emits one `ColumnBatch` per row group |
-| `ColumnBatch` | `segmentagg` | Holds decoded column arrays (`segmentIds`, `impressions`, `revenues`) + timing |
-| `SegmentRevenueAggregator` | `segmentagg` | Aggregates a `ColumnBatch` into a `PartialAggregate`; merges partials |
-| `AggregationPipeline` | `segmentagg` | Wires the Akka Streams topology; owns the `ActorSystem` lifecycle |
-| `DecodeMode` | `parquet` | Chooses between scalar (row-at-a-time) and vectorised (batch-at-a-time) decoding |
-| `CsvResultWriter` | `io` | Writes the final `Vector[AggregateRow]` to a CSV file |
-| `NoOpResultWriter` | `io` | Discards output — used during benchmarking to avoid I/O skewing timing |
-| `StageMetrics` | `metrics` | Per-stage latency (fetch, decode, aggregate, wait) with p50/p95/max |
-| `DecoderPageMetrics` | `parquet` | Per-column page-level decode latency |
-| `PipelineLogger` | `logging` | Structured logger abstraction (console implementation provided) |
+- `--read-parallelism N` — Number of concurrent file readers (max 16 for 16 files)
+- `--aggregate-parallelism M` — Number of concurrent aggregate workers (should be ≤ read-parallelism)
 
-### Decode modes
+For 12-core system: use `--read-parallelism 12 --aggregate-parallelism 12`
 
-| Mode | How it works |
-|---|---|
-| `scalar` | Decodes one value at a time in a `while` loop |
-| `vectorised` | Decodes an entire page into a pre-allocated array in one pass; avoids per-row branching |
+## Generate Test Data (500M rows)
 
-Vectorised is consistently ~25–30% faster on high-entropy data (see benchmark results below).
+Using [DuckDB](https://duckdb.org/):
 
-### Parallelism
+```bash
+duckdb << 'EOF'
+CREATE TABLE fact_events AS
+SELECT
+    ABS(hash(i) % 10000000) AS segment_id,
+    (ABS(hash(i + 1) % 1000) + 1) AS impressions,
+    ABS(hash(i + 2) % 999999) * 0.00000100001 + ABS(hash(i + 3) % 9973) * 0.001 AS revenue
+FROM range(500000000) t(i);
 
-Two independent knobs control throughput:
+COPY fact_events TO '/path/to/fact_events_parquet' (FORMAT parquet, ROW_GROUP_SIZE 65536);
+EOF
+```
 
-- `--read-parallelism` — number of Parquet files read concurrently (`flatMapMerge` breadth)
-- `--aggregate-parallelism` — number of `PartialAggregate` workers running concurrently (`mapAsyncUnordered`)
+Output: 16 Parquet files (~650MB each)
 
-Aggregate parallelism should always be ≤ read parallelism. Increasing aggregate beyond read adds no gain because read is the bottleneck.
+## CLI Options
 
----
+```
+--input <path>                Path to Parquet file or directory (required)
+--output <path>               Path for CSV output file (required)
+--read-parallelism <n>        Concurrent file readers (default: nCPU)
+--aggregate-parallelism <n>   Concurrent aggregate workers (default: nCPU)
+--parallelism <n>             Set both read and aggregate (default: nCPU)
+```
+
+## Output Format
+
+CSV with 10M unique segment IDs:
+```csv
+segment_id,total_impressions,total_revenue
+1,102345,123.45
+2,98765,98.76
+...
+```
 
 ## Project Structure
 
 ```
 src/main/scala/com/example/segmentagg/
-├── AggregationPipeline.scala       # stream topology + lifecycle
-├── ColumnBatch.scala               # columnar batch model
-├── BatchTiming.scala               # per-batch timing counters
+├── AggregationPipeline.scala       # Main pipeline orchestrator
+├── ParquetBatchSource.scala        # Reads Parquet files
+├── SegmentRevenueAggregator.scala  # Partial aggregation + merge
+├── ColumnBatch.scala               # Columnar data model
 ├── Main.scala                      # CLI entry point
-├── ParquetBatchSource.scala        # Parquet → ColumnBatch source
-├── SegmentRevenueAggregator.scala  # partial aggregation + merge
-├── io/
-│   ├── ResultWriter.scala          # output writer trait
-│   ├── CsvResultWriter.scala       # CSV implementation
-│   └── NoOpResultWriter.scala      # no-op for benchmarks
-├── logging/
-│   └── PipelineLogger.scala        # logger abstraction
-├── metrics/
-│   ├── LatencyDistribution.scala   # histogram + formatting
-│   └── StageMetrics.scala          # named per-stage collectors
 ├── model/
-│   ├── AggregateRow.scala          # output row model
-│   └── PipelineConfig.scala        # immutable pipeline config
+│   ├── PipelineConfig.scala        # Immutable config
+│   └── AggregateRow.scala          # Output row
+├── io/
+│   ├── ResultWriter.scala          # Output abstraction
+│   ├── CsvResultWriter.scala       # CSV implementation
+│   └── NoOpResultWriter.scala      # No-op for benchmarks
+├── metrics/
+│   ├── StageMetrics.scala          # Per-stage latency
+│   └── LatencyDistribution.scala   # Histogram + formatting
+├── logging/
+│   └── PipelineLogger.scala        # Logger abstraction
 ├── parquet/
-│   ├── ColumnChunkDecoder.scala         # scalar decoder
+│   ├── DecodeMode.scala            # Scalar vs Vectorised
+│   ├── ColumnChunkDecoder.scala    # Scalar decoder
 │   ├── VectorisedColumnChunkDecoder.scala
-│   ├── VectorisedDecoders.scala
-│   ├── DecodeMode.scala
-│   ├── DecoderPageMetrics.scala
-│   ├── RequiredColumnDecoders.scala
 │   └── ...
 └── util/
-    ├── Benchmark.scala             # parallelism grid-search benchmark
-    └── ParquetFooterInspector.scala # inspect Parquet file metadata
+    ├── Benchmark.scala             # Performance grid search
+    └── ParquetFooterInspector.scala # Parquet metadata
+
+src/test/scala/...                 # Test suite
+src/main/resources/
+├── logback.xml                    # Logging configuration
+└── application.conf               # Akka configuration
 ```
 
----
+## Configuration
 
-## Run
-
-```bash
-sbt "run \
-  --input  /path/to/fact_events_parquet \
-  --output /path/to/results.csv \
-  --read-parallelism 10 \
-  --aggregate-parallelism 10 \
-  --decode-mode vectorised"
+### JVM Options (in build.sbt)
+```scala
+-Xmx4g              # Heap size
+-XX:+UseG1GC        # Garbage collector
 ```
 
-**CLI flags**
+### Logging (logback.xml)
+- INFO and above to console
+- Rolling files (100MB or daily)
+- Suppressed Hadoop/Parquet verbose logs
 
-| Flag | Default | Description |
-|---|---|---|
-| `--input` | required | Path to a Parquet file or directory |
-| `--output` | required | Path for the CSV output file |
-| `--read-parallelism` | `nCPU` | Concurrent Parquet file readers |
-| `--aggregate-parallelism` | `nCPU` | Concurrent partial-aggregate workers (≤ read-parallelism) |
-| `--decode-mode` | `scalar` | `scalar` or `vectorised` |
-| `--parallelism` | `nCPU` | Sets both read and aggregate parallelism in one flag |
+### Akka (application.conf)
+- Fork-join executor with parallelism tuning
+- Back-pressure with bounded buffers (initial=1, max=1)
 
----
+## Performance Benchmarks (500M rows, 12-core)
 
-## Benchmark
+| Read | Agg | Mode | Runtime | Throughput |
+|-----|-----|------|---------|-----------|
+| 8 | 8 | scalar | 56.6s | 8.8M rows/s |
+| 8 | 8 | vectorised | 54.8s | 9.1M rows/s |
+| 12 | 12 | scalar | 55.2s | 9.1M rows/s |
+| **12** | **12** | **vectorised** | **54.1s** | **9.2M rows/s** |
 
-Runs all combinations of `read-parallelism × aggregate-parallelism` with vectorised decoding and writes results to `/tmp/benchmark_results.csv`.
-
+To run benchmarks:
 ```bash
-sbt "runMain com.example.segmentagg.util.Benchmark /path/to/fact_events_parquet"
+sbt "runMain com.example.segmentagg.util.Benchmark /path/to/parquet"
+# Output: /tmp/benchmark_results.csv
 ```
 
-Grid searched: `read ∈ {4,6,8,10,12,16}`, `agg ∈ {4,6,8,10,12}` where `agg ≤ read`.
-
-To inspect Parquet file metadata:
-```bash
-sbt "runMain com.example.segmentagg.util.ParquetFooterInspector /path/to/file.parquet"
-```
-
----
-
-## Test
+## Testing
 
 ```bash
+# Run all tests
 sbt test
+
+# Run specific test
+sbt "testOnly com.example.segmentagg.SegmentRevenueAggregatorSpec"
 ```
 
-Tests cover: aggregation correctness, merge commutativity, empty batch handling, high-parallelism stress, determinism across repeated runs, CSV writer, latency metrics, decode modes.
+## Logging Output
 
----
+```
+[2026-05-15T14:32:10.123Z] [AggregationPipeline] INFO Starting job
+[2026-05-15T14:33:04.567Z] [AggregationPipeline] INFO Final aggregate materialised with 10000000 groups (total elapsed=54432.44 ms)
+[2026-05-15T14:33:04.573Z] [AggregationPipeline] INFO Stage metrics fetch=count=7631 avg=0.24 ms p50=0.16 ms p95=0.60 ms max=51.21 ms
+[2026-05-15T14:33:04.580Z] [AggregationPipeline] INFO Stage metrics decode=count=7631 avg=5.28 ms p50=2.44 ms p95=4.61 ms max=1158.48 ms
+```
 
-## Notes
+Per-stage latencies:
+- **fetch**: Read row group from file
+- **decode**: Decode columns (segment_id, impressions, revenue)
+- **aggregate**: Build partial aggregate (LongMap)
+- **wait**: Time waiting for upstream (depends on parallelism)
 
-- Single-node only — not a distributed system.
-- The final `GROUP BY` state grows with the number of distinct `segment_id` values (unavoidable for exact aggregation).
-- Back-pressure is enforced with `inputBuffer(1, 1)` so the source does not read ahead and blow up heap.
-- The `ActorSystem` is created and torn down per pipeline run; it is not shared across benchmark iterations.
+## License
+
+MIT License - see LICENSE file
+
